@@ -4,6 +4,8 @@ import com.minikv.api.StorageEngine;
 import com.minikv.memtable.MemTable;
 import com.minikv.model.Entry;
 import com.minikv.model.EntryType;
+import com.minikv.sstable.SSTable;
+import com.minikv.sstable.SSTableWriter;
 import com.minikv.wal.WAL;
 import com.minikv.wal.WALRecovery;
 
@@ -11,20 +13,32 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
 public class LSMTree implements StorageEngine {
     private static final Logger LOG = Logger.getLogger(LSMTree.class.getName());
+    private static final long MEMTABLE_FLUSH_THRESHOLD = 4 * 1024 * 1024;
 
     private final Path dataDir;
     private final AtomicLong seqCounter = new AtomicLong(0);
     private volatile MemTable activeMemTable;
     private volatile WAL activeWAL;
 
+    private final List<SSTable> sstables = new CopyOnWriteArrayList<>();
+    private final ReadWriteLock sstableLock = new ReentrantReadWriteLock();
+    private final ExecutorService flushExecutor;
+
     public LSMTree(Path dataDir) throws IOException {
         this.dataDir = dataDir;
         Files.createDirectories(dataDir);
+        this.flushExecutor = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "flush-worker"); t.setDaemon(true); return t;
+        });
 
         WALRecovery recovery = new WALRecovery(dataDir);
         WALRecovery.RecoveryResult result = recovery.recover(seqCounter);
@@ -34,13 +48,12 @@ public class LSMTree implements StorageEngine {
                     + result.segmentsReplayed() + " segments");
         }
 
+        loadExistingSSTables();
         this.activeWAL = new WAL(dataDir, seqCounter.get());
     }
 
     @Override
-    public void put(String key, byte[] value) throws IOException {
-        put(key, value, 0);
-    }
+    public void put(String key, byte[] value) throws IOException { put(key, value, 0); }
 
     @Override
     public void put(String key, byte[] value, long ttlSeconds) throws IOException {
@@ -49,6 +62,7 @@ public class LSMTree implements StorageEngine {
         synchronized (this) {
             activeWAL.appendPut(key, value, seq);
             activeMemTable.put(key, entry);
+            maybeFlush();
         }
     }
 
@@ -58,6 +72,21 @@ public class LSMTree implements StorageEngine {
         if (entry != null) {
             if (entry.isTombstone()) return Optional.empty();
             return Optional.of(entry.getValue());
+        }
+        sstableLock.readLock().lock();
+        try {
+            List<SSTable> snapshot = new ArrayList<>(sstables);
+            for (int i = snapshot.size() - 1; i >= 0; i--) {
+                SSTable sst = snapshot.get(i);
+                if (!sst.mightContain(key)) continue;
+                Entry found = sst.get(key);
+                if (found != null) {
+                    if (found.isTombstone()) return Optional.empty();
+                    return Optional.of(found.getValue());
+                }
+            }
+        } finally {
+            sstableLock.readLock().unlock();
         }
         return Optional.empty();
     }
@@ -69,22 +98,89 @@ public class LSMTree implements StorageEngine {
         synchronized (this) {
             activeWAL.appendDelete(key, seq);
             activeMemTable.put(key, tombstone);
+            maybeFlush();
         }
     }
 
     @Override
     public Iterator<Entry> scan(String fromKey, String toKey) throws IOException {
-        List<Entry> results = new ArrayList<>();
-        Iterator<Map.Entry<String, Entry>> it = activeMemTable.iterator(fromKey, toKey);
-        while (it.hasNext()) {
-            Entry e = it.next().getValue();
-            if (!e.isTombstone()) results.add(e);
+        TreeMap<String, Entry> merged = new TreeMap<>();
+        sstableLock.readLock().lock();
+        try {
+            for (SSTable sst : sstables) {
+                Iterator<Entry> it = sst.iterator();
+                while (it.hasNext()) {
+                    Entry e = it.next();
+                    if (e.getKey().compareTo(fromKey) >= 0 && e.getKey().compareTo(toKey) <= 0)
+                        merged.merge(e.getKey(), e, (ex, in) -> in.getSeqNum() > ex.getSeqNum() ? in : ex);
+                }
+            }
+        } finally { sstableLock.readLock().unlock(); }
+        Iterator<Map.Entry<String, Entry>> memIt = activeMemTable.iterator(fromKey, toKey);
+        while (memIt.hasNext()) {
+            Map.Entry<String, Entry> me = memIt.next();
+            merged.put(me.getKey(), me.getValue());
         }
-        return results.iterator();
+        return merged.values().stream().filter(e -> !e.isTombstone()).iterator();
     }
 
     @Override
     public void close() throws IOException {
+        flushExecutor.shutdown();
+        try { flushExecutor.awaitTermination(10, TimeUnit.SECONDS); }
+        catch (InterruptedException e) { Thread.currentThread().interrupt(); }
         synchronized (this) { activeWAL.close(); }
+        for (SSTable sst : sstables) { try { sst.close(); } catch (IOException ignored) {} }
+    }
+
+    private void maybeFlush() {
+        if (activeMemTable.shouldFlush(MEMTABLE_FLUSH_THRESHOLD)) triggerFlush();
+    }
+
+    private synchronized void triggerFlush() {
+        if (!activeMemTable.shouldFlush(MEMTABLE_FLUSH_THRESHOLD) || activeMemTable.isFrozen()) return;
+        MemTable frozen = activeMemTable;
+        WAL oldWAL = activeWAL;
+        frozen.freeze();
+        try { activeWAL = new WAL(dataDir, seqCounter.get()); }
+        catch (IOException e) { LOG.log(Level.SEVERE, "Failed to create new WAL", e); return; }
+        activeMemTable = new MemTable();
+        flushExecutor.submit(() -> {
+            try { flushMemTable(frozen); oldWAL.delete(); }
+            catch (IOException e) { LOG.log(Level.SEVERE, "Flush failed", e); }
+        });
+    }
+
+    private void flushMemTable(MemTable frozen) throws IOException {
+        Path sstPath = dataDir.resolve("sstable-" + System.currentTimeMillis() + ".sst");
+        SSTableWriter writer = new SSTableWriter(sstPath);
+        SSTable newSSTable = writer.write(frozen.iterator(), frozen.size());
+        sstableLock.writeLock().lock();
+        try { sstables.add(newSSTable); } finally { sstableLock.writeLock().unlock(); }
+    }
+
+    public void atomicSwapSSTables(List<SSTable> toRemove, List<SSTable> toAdd) {
+        sstableLock.writeLock().lock();
+        try { sstables.removeAll(toRemove); sstables.addAll(toAdd); }
+        finally { sstableLock.writeLock().unlock(); }
+    }
+
+    public List<SSTable> getSSTables() {
+        sstableLock.readLock().lock();
+        try { return new ArrayList<>(sstables); } finally { sstableLock.readLock().unlock(); }
+    }
+
+    private void loadExistingSSTables() throws IOException {
+        if (!Files.exists(dataDir)) return;
+        List<Path> sstFiles = new ArrayList<>();
+        try (var stream = Files.list(dataDir)) {
+            stream.filter(p -> p.getFileName().toString().endsWith(".sst"))
+                    .sorted(Comparator.comparing(p -> p.getFileName().toString()))
+                    .forEach(sstFiles::add);
+        }
+        for (Path p : sstFiles) {
+            try { sstables.add(new SSTable(p)); }
+            catch (IOException e) { LOG.warning("Could not load SSTable " + p + ": " + e.getMessage()); }
+        }
     }
 }
