@@ -2,7 +2,6 @@ package com.minikv.compaction;
 
 import com.minikv.core.LSMTree;
 import com.minikv.model.Entry;
-import com.minikv.model.EntryType;
 import com.minikv.sstable.SSTable;
 import com.minikv.sstable.SSTableWriter;
 
@@ -40,7 +39,8 @@ public class CompactionWorker {
 
     public void runCompaction() {
         List<SSTable> snapshot = lsmTree.getSSTables();
-        for (List<SSTable> group : strategy.selectFilesToMerge(snapshot)) {
+        List<List<SSTable>> groups = strategy.selectFilesToMerge(snapshot);
+        for (List<SSTable> group : groups) {
             try { compactGroup(group); }
             catch (IOException e) { LOG.log(Level.SEVERE, "Compaction failed", e); }
         }
@@ -50,7 +50,9 @@ public class CompactionWorker {
         List<Iterator<Entry>> iterators = new ArrayList<>();
         for (SSTable sst : group) iterators.add(sst.iterator());
 
-        List<Entry> merged = kWayMerge(iterators);
+        // isFinalLevel = true when no older SSTables exist outside this group
+        boolean isFinalLevel = group.size() >= lsmTree.getSSTables().size();
+        List<Entry> merged = kWayMerge(iterators, isFinalLevel);
         if (merged.isEmpty()) {
             lsmTree.atomicSwapSSTables(group, List.of());
             for (SSTable sst : group) sst.delete();
@@ -65,7 +67,7 @@ public class CompactionWorker {
         for (SSTable sst : group) sst.delete();
     }
 
-    private List<Entry> kWayMerge(List<Iterator<Entry>> iterators) {
+    private List<Entry> kWayMerge(List<Iterator<Entry>> iterators, boolean isFinalLevel) {
         record HeapEntry(Entry entry, int sourceIdx) {}
         PriorityQueue<HeapEntry> heap = new PriorityQueue<>(
                 Comparator.comparing((HeapEntry he) -> he.entry().getKey())
@@ -82,7 +84,8 @@ public class CompactionWorker {
                 heap.offer(new HeapEntry(iterators.get(he.sourceIdx()).next(), he.sourceIdx()));
             if (entry.getKey().equals(lastKey)) continue;
             lastKey = entry.getKey();
-            if (entry.isTombstone()) continue; // always drop tombstones (to be fixed)
+            // Tombstones must survive until the final level so reads above still see the deletion
+            if (isFinalLevel && entry.isTombstone()) continue;
             result.add(entry);
         }
         return result;
