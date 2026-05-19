@@ -1,5 +1,6 @@
 package com.minikv.sstable;
 
+import com.minikv.cache.LRUBlockCache;
 import com.minikv.filter.BloomFilter;
 import com.minikv.model.Entry;
 
@@ -17,19 +18,20 @@ public class SSTable implements Closeable {
         this.reader = new SSTableReader(path);
     }
 
-    public Entry get(String key) { return reader.get(key); }
+    public Entry get(String key, LRUBlockCache cache) { return reader.get(key, cache); }
 
     public BloomFilter bloomFilter() { return reader.getBloomFilter(); }
     public boolean mightContain(String key) { return reader.getBloomFilter().mightContain(key); }
     public Iterator<Entry> iterator() { return reader.iterator(); }
     public Path getPath() { return path; }
     public long sizeBytes() { return path.toFile().length(); }
+    public long diskReadCount() { return reader.diskReadCount(); }
 
     @Override
     public void close() throws IOException { reader.close(); }
 
     public void delete() throws IOException {
-        reader.close();
+        reader.close(); // MappedByteBuffer mapping stays valid per Java spec
         java.nio.file.Files.deleteIfExists(path);
     }
 }
