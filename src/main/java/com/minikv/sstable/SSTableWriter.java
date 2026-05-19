@@ -15,11 +15,10 @@ import java.util.Map;
 /**
  * SSTable binary layout:
  * [Data blocks][Sparse index][Bloom filter][Footer: 8+8+4 bytes]
- * Entry format: [4:keyLen][key][4:valLen][value][1:type][8:seqNum]
+ * Entry format: [4:keyLen][key][4:valLen][value][1:type][8:seqNum][8:expiresAt]
  */
 public class SSTableWriter {
     private static final int SPARSE_INDEX_INTERVAL = 16;
-
     private final Path outputPath;
 
     public SSTableWriter(Path outputPath) { this.outputPath = outputPath; }
@@ -38,22 +37,20 @@ public class SSTableWriter {
             while (sortedEntries.hasNext()) {
                 Map.Entry<String, Entry> mapEntry = sortedEntries.next();
                 Entry entry = mapEntry.getValue();
-                String key = entry.getKey();
                 byte[] value = entry.getValue() != null ? entry.getValue() : new byte[0];
-                byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
+                byte[] keyBytes = entry.getKey().getBytes(StandardCharsets.UTF_8);
 
-                bloomFilter.add(key);
-                if (entryCount % SPARSE_INDEX_INTERVAL == 0) index.add(key, currentOffset);
+                bloomFilter.add(entry.getKey());
+                if (entryCount % SPARSE_INDEX_INTERVAL == 0) index.add(entry.getKey(), currentOffset);
 
-                // [4:keyLen][key][4:valLen][val][1:type][8:seqNum]
-                int entrySize = 4 + keyBytes.length + 4 + value.length + 1 + 8;
+                // [4:keyLen][key][4:valLen][val][1:type][8:seqNum][8:expiresAt]
+                int entrySize = 4 + keyBytes.length + 4 + value.length + 1 + 8 + 8;
                 ByteBuffer entryBuf = ByteBuffer.allocate(entrySize);
-                entryBuf.putInt(keyBytes.length);
-                entryBuf.put(keyBytes);
-                entryBuf.putInt(value.length);
-                entryBuf.put(value);
+                entryBuf.putInt(keyBytes.length); entryBuf.put(keyBytes);
+                entryBuf.putInt(value.length); entryBuf.put(value);
                 entryBuf.put(entry.getType().code);
                 entryBuf.putLong(entry.getSeqNum());
+                entryBuf.putLong(entry.getExpiresAt());
                 entryBuf.flip();
                 while (entryBuf.hasRemaining()) currentOffset += channel.write(entryBuf);
                 entryCount++;
@@ -73,8 +70,7 @@ public class SSTableWriter {
             ByteBuffer bloomBuf = ByteBuffer.allocate(4 + bloomData.length * 8);
             bloomBuf.putInt(bloomFilter.getBitSize());
             for (long l : bloomData) bloomBuf.putLong(l);
-            bloomBuf.flip();
-            channel.write(bloomBuf);
+            bloomBuf.flip(); channel.write(bloomBuf);
 
             ByteBuffer footer = ByteBuffer.allocate(20);
             footer.putLong(indexOffset); footer.putLong(bloomOffset);
