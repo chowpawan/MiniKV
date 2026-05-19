@@ -39,8 +39,7 @@ public class CompactionWorker {
 
     public void runCompaction() {
         List<SSTable> snapshot = lsmTree.getSSTables();
-        List<List<SSTable>> groups = strategy.selectFilesToMerge(snapshot);
-        for (List<SSTable> group : groups) {
+        for (List<SSTable> group : strategy.selectFilesToMerge(snapshot)) {
             try { compactGroup(group); }
             catch (IOException e) { LOG.log(Level.SEVERE, "Compaction failed", e); }
         }
@@ -50,7 +49,6 @@ public class CompactionWorker {
         List<Iterator<Entry>> iterators = new ArrayList<>();
         for (SSTable sst : group) iterators.add(sst.iterator());
 
-        // isFinalLevel = true when no older SSTables exist outside this group
         boolean isFinalLevel = group.size() >= lsmTree.getSSTables().size();
         List<Entry> merged = kWayMerge(iterators, isFinalLevel);
         if (merged.isEmpty()) {
@@ -84,8 +82,8 @@ public class CompactionWorker {
                 heap.offer(new HeapEntry(iterators.get(he.sourceIdx()).next(), he.sourceIdx()));
             if (entry.getKey().equals(lastKey)) continue;
             lastKey = entry.getKey();
-            // Tombstones must survive until the final level so reads above still see the deletion
-            if (isFinalLevel && entry.isTombstone()) continue;
+            // Drop tombstones and expired entries only at the final level
+            if (isFinalLevel && (entry.isTombstone() || entry.isExpired())) continue;
             result.add(entry);
         }
         return result;
