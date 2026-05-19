@@ -1,6 +1,9 @@
 package com.minikv.core;
 
 import com.minikv.api.StorageEngine;
+import com.minikv.compaction.CompactionStrategy;
+import com.minikv.compaction.CompactionWorker;
+import com.minikv.compaction.SizeTieredCompaction;
 import com.minikv.memtable.MemTable;
 import com.minikv.model.Entry;
 import com.minikv.model.EntryType;
@@ -32,6 +35,7 @@ public class LSMTree implements StorageEngine {
     private final List<SSTable> sstables = new CopyOnWriteArrayList<>();
     private final ReadWriteLock sstableLock = new ReentrantReadWriteLock();
     private final ExecutorService flushExecutor;
+    private final CompactionWorker compactionWorker;
 
     public LSMTree(Path dataDir) throws IOException {
         this.dataDir = dataDir;
@@ -50,10 +54,13 @@ public class LSMTree implements StorageEngine {
 
         loadExistingSSTables();
         this.activeWAL = new WAL(dataDir, seqCounter.get());
+
+        CompactionStrategy strategy = new SizeTieredCompaction();
+        this.compactionWorker = new CompactionWorker(this, strategy, dataDir);
+        this.compactionWorker.start();
     }
 
-    @Override
-    public void put(String key, byte[] value) throws IOException { put(key, value, 0); }
+    @Override public void put(String key, byte[] value) throws IOException { put(key, value, 0); }
 
     @Override
     public void put(String key, byte[] value, long ttlSeconds) throws IOException {
@@ -85,9 +92,7 @@ public class LSMTree implements StorageEngine {
                     return Optional.of(found.getValue());
                 }
             }
-        } finally {
-            sstableLock.readLock().unlock();
-        }
+        } finally { sstableLock.readLock().unlock(); }
         return Optional.empty();
     }
 
@@ -117,15 +122,13 @@ public class LSMTree implements StorageEngine {
             }
         } finally { sstableLock.readLock().unlock(); }
         Iterator<Map.Entry<String, Entry>> memIt = activeMemTable.iterator(fromKey, toKey);
-        while (memIt.hasNext()) {
-            Map.Entry<String, Entry> me = memIt.next();
-            merged.put(me.getKey(), me.getValue());
-        }
+        while (memIt.hasNext()) { Map.Entry<String, Entry> me = memIt.next(); merged.put(me.getKey(), me.getValue()); }
         return merged.values().stream().filter(e -> !e.isTombstone()).iterator();
     }
 
     @Override
     public void close() throws IOException {
+        compactionWorker.stop();
         flushExecutor.shutdown();
         try { flushExecutor.awaitTermination(10, TimeUnit.SECONDS); }
         catch (InterruptedException e) { Thread.currentThread().interrupt(); }
@@ -153,8 +156,7 @@ public class LSMTree implements StorageEngine {
 
     private void flushMemTable(MemTable frozen) throws IOException {
         Path sstPath = dataDir.resolve("sstable-" + System.currentTimeMillis() + ".sst");
-        SSTableWriter writer = new SSTableWriter(sstPath);
-        SSTable newSSTable = writer.write(frozen.iterator(), frozen.size());
+        SSTable newSSTable = new SSTableWriter(sstPath).write(frozen.iterator(), frozen.size());
         sstableLock.writeLock().lock();
         try { sstables.add(newSSTable); } finally { sstableLock.writeLock().unlock(); }
     }
@@ -180,7 +182,7 @@ public class LSMTree implements StorageEngine {
         }
         for (Path p : sstFiles) {
             try { sstables.add(new SSTable(p)); }
-            catch (IOException e) { LOG.warning("Could not load SSTable " + p + ": " + e.getMessage()); }
+            catch (IOException e) { LOG.warning("Could not load " + p + ": " + e.getMessage()); }
         }
     }
 }
