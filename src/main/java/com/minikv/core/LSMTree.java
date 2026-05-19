@@ -1,6 +1,7 @@
 package com.minikv.core;
 
 import com.minikv.api.StorageEngine;
+import com.minikv.cache.LRUBlockCache;
 import com.minikv.compaction.CompactionStrategy;
 import com.minikv.compaction.CompactionWorker;
 import com.minikv.compaction.SizeTieredCompaction;
@@ -26,6 +27,7 @@ import java.util.logging.Logger;
 public class LSMTree implements StorageEngine {
     private static final Logger LOG = Logger.getLogger(LSMTree.class.getName());
     private static final long MEMTABLE_FLUSH_THRESHOLD = 4 * 1024 * 1024;
+    private static final int BLOCK_CACHE_MAX_BLOCKS = 1024;
 
     private final Path dataDir;
     private final AtomicLong seqCounter = new AtomicLong(0);
@@ -34,12 +36,14 @@ public class LSMTree implements StorageEngine {
 
     private final List<SSTable> sstables = new CopyOnWriteArrayList<>();
     private final ReadWriteLock sstableLock = new ReentrantReadWriteLock();
+    private final LRUBlockCache blockCache;
     private final ExecutorService flushExecutor;
     private final CompactionWorker compactionWorker;
 
     public LSMTree(Path dataDir) throws IOException {
         this.dataDir = dataDir;
         Files.createDirectories(dataDir);
+        this.blockCache = new LRUBlockCache(BLOCK_CACHE_MAX_BLOCKS);
         this.flushExecutor = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "flush-worker"); t.setDaemon(true); return t;
         });
@@ -65,9 +69,10 @@ public class LSMTree implements StorageEngine {
     @Override
     public void put(String key, byte[] value, long ttlSeconds) throws IOException {
         long seq = seqCounter.getAndIncrement();
-        Entry entry = new Entry(key, value, seq, EntryType.PUT);
+        long expiresAt = ttlSeconds > 0 ? System.currentTimeMillis() + ttlSeconds * 1000L : 0;
+        Entry entry = new Entry(key, value, seq, EntryType.PUT, expiresAt);
         synchronized (this) {
-            activeWAL.appendPut(key, value, seq);
+            activeWAL.appendPut(key, value, seq, expiresAt);
             activeMemTable.put(key, entry);
             maybeFlush();
         }
@@ -77,7 +82,7 @@ public class LSMTree implements StorageEngine {
     public Optional<byte[]> get(String key) throws IOException {
         Entry entry = activeMemTable.get(key);
         if (entry != null) {
-            if (entry.isTombstone()) return Optional.empty();
+            if (entry.isTombstone() || entry.isExpired()) return Optional.empty();
             return Optional.of(entry.getValue());
         }
         sstableLock.readLock().lock();
@@ -86,9 +91,9 @@ public class LSMTree implements StorageEngine {
             for (int i = snapshot.size() - 1; i >= 0; i--) {
                 SSTable sst = snapshot.get(i);
                 if (!sst.mightContain(key)) continue;
-                Entry found = sst.get(key);
+                Entry found = sst.get(key, blockCache);
                 if (found != null) {
-                    if (found.isTombstone()) return Optional.empty();
+                    if (found.isTombstone() || found.isExpired()) return Optional.empty();
                     return Optional.of(found.getValue());
                 }
             }
@@ -123,7 +128,7 @@ public class LSMTree implements StorageEngine {
         } finally { sstableLock.readLock().unlock(); }
         Iterator<Map.Entry<String, Entry>> memIt = activeMemTable.iterator(fromKey, toKey);
         while (memIt.hasNext()) { Map.Entry<String, Entry> me = memIt.next(); merged.put(me.getKey(), me.getValue()); }
-        return merged.values().stream().filter(e -> !e.isTombstone()).iterator();
+        return merged.values().stream().filter(e -> !e.isTombstone() && !e.isExpired()).iterator();
     }
 
     @Override
