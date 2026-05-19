@@ -6,6 +6,7 @@ import com.minikv.compaction.CompactionStrategy;
 import com.minikv.compaction.CompactionWorker;
 import com.minikv.compaction.SizeTieredCompaction;
 import com.minikv.memtable.MemTable;
+import com.minikv.metrics.StorageMetrics;
 import com.minikv.model.Entry;
 import com.minikv.model.EntryType;
 import com.minikv.sstable.SSTable;
@@ -58,7 +59,6 @@ public class LSMTree implements StorageEngine {
 
         loadExistingSSTables();
         this.activeWAL = new WAL(dataDir, seqCounter.get());
-
         CompactionStrategy strategy = new SizeTieredCompaction();
         this.compactionWorker = new CompactionWorker(this, strategy, dataDir);
         this.compactionWorker.start();
@@ -74,31 +74,39 @@ public class LSMTree implements StorageEngine {
         synchronized (this) {
             activeWAL.appendPut(key, value, seq, expiresAt);
             activeMemTable.put(key, entry);
+            StorageMetrics.writesTotal.inc();
             maybeFlush();
         }
     }
 
     @Override
     public Optional<byte[]> get(String key) throws IOException {
-        Entry entry = activeMemTable.get(key);
-        if (entry != null) {
-            if (entry.isTombstone() || entry.isExpired()) return Optional.empty();
-            return Optional.of(entry.getValue());
-        }
-        sstableLock.readLock().lock();
+        StorageMetrics.readsTotal.inc();
+        long startNs = System.nanoTime();
         try {
-            List<SSTable> snapshot = new ArrayList<>(sstables);
-            for (int i = snapshot.size() - 1; i >= 0; i--) {
-                SSTable sst = snapshot.get(i);
-                if (!sst.mightContain(key)) continue;
-                Entry found = sst.get(key, blockCache);
-                if (found != null) {
-                    if (found.isTombstone() || found.isExpired()) return Optional.empty();
-                    return Optional.of(found.getValue());
-                }
+            Entry entry = activeMemTable.get(key);
+            if (entry != null) {
+                if (entry.isTombstone() || entry.isExpired()) return Optional.empty();
+                return Optional.of(entry.getValue());
             }
-        } finally { sstableLock.readLock().unlock(); }
-        return Optional.empty();
+            sstableLock.readLock().lock();
+            try {
+                List<SSTable> snapshot = new ArrayList<>(sstables);
+                for (int i = snapshot.size() - 1; i >= 0; i--) {
+                    SSTable sst = snapshot.get(i);
+                    if (!sst.mightContain(key)) { StorageMetrics.bloomSkips.inc(); continue; }
+                    Entry found = sst.get(key, blockCache);
+                    if (found != null) {
+                        if (!sst.mightContain(key)) StorageMetrics.bloomFalsePositives.inc();
+                        if (found.isTombstone() || found.isExpired()) return Optional.empty();
+                        return Optional.of(found.getValue());
+                    }
+                }
+            } finally { sstableLock.readLock().unlock(); }
+            return Optional.empty();
+        } finally {
+            StorageMetrics.readLatencyMs.observe((System.nanoTime() - startNs) / 1_000_000.0);
+        }
     }
 
     @Override
@@ -108,6 +116,7 @@ public class LSMTree implements StorageEngine {
         synchronized (this) {
             activeWAL.appendDelete(key, seq);
             activeMemTable.put(key, tombstone);
+            StorageMetrics.deletesTotal.inc();
             maybeFlush();
         }
     }
@@ -154,7 +163,7 @@ public class LSMTree implements StorageEngine {
         catch (IOException e) { LOG.log(Level.SEVERE, "Failed to create new WAL", e); return; }
         activeMemTable = new MemTable();
         flushExecutor.submit(() -> {
-            try { flushMemTable(frozen); oldWAL.delete(); }
+            try { flushMemTable(frozen); oldWAL.delete(); StorageMetrics.memTableFlushes.inc(); }
             catch (IOException e) { LOG.log(Level.SEVERE, "Flush failed", e); }
         });
     }
