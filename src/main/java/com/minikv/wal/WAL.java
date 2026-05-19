@@ -26,26 +26,20 @@ public class WAL implements Closeable {
         channel.force(true); // fsync — durability guarantee
     }
 
-    public void appendPut(String key, byte[] value, long seqNum) throws IOException {
-        append(new WALEntry(key, value, EntryType.PUT, seqNum));
+    public void appendPut(String key, byte[] value, long seqNum, long expiresAt) throws IOException {
+        append(new WALEntry(key, value, EntryType.PUT, seqNum, expiresAt));
     }
 
     public void appendDelete(String key, long seqNum) throws IOException {
-        append(new WALEntry(key, new byte[0], EntryType.DELETE, seqNum));
+        append(new WALEntry(key, new byte[0], EntryType.DELETE, seqNum, 0));
     }
 
     public Path getPath() { return path; }
 
     @Override
     public void close() throws IOException {
-        if (channel != null && channel.isOpen()) {
-            channel.force(true);
-            channel.close();
-        }
+        if (channel != null && channel.isOpen()) { channel.force(true); channel.close(); }
     }
 
-    public void delete() throws IOException {
-        close();
-        java.nio.file.Files.deleteIfExists(path);
-    }
+    public void delete() throws IOException { close(); java.nio.file.Files.deleteIfExists(path); }
 }

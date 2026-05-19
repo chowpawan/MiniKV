@@ -22,7 +22,7 @@ class WALRecoveryTest {
     @Test
     void recovers1000Entries() throws IOException {
         WAL wal = new WAL(tempDir, 0);
-        for (int i = 0; i < 1000; i++) wal.appendPut("key-" + i, ("value-" + i).getBytes(), i);
+        for (int i = 0; i < 1000; i++) wal.appendPut("key-" + i, ("value-" + i).getBytes(), i, 0);
         wal.close();
 
         AtomicLong seq = new AtomicLong(0);
@@ -38,8 +38,8 @@ class WALRecoveryTest {
     @Test
     void latestValueWinsOnOverwrite() throws IOException {
         WAL wal = new WAL(tempDir, 0);
-        for (int i = 0; i < 100; i++) wal.appendPut("key-" + i, ("original-" + i).getBytes(), i);
-        for (int i = 0; i < 50; i++) wal.appendPut("key-" + i, ("updated-" + i).getBytes(), 100 + i);
+        for (int i = 0; i < 100; i++) wal.appendPut("key-" + i, ("original-" + i).getBytes(), i, 0);
+        for (int i = 0; i < 50; i++) wal.appendPut("key-" + i, ("updated-" + i).getBytes(), 100+i, 0);
         wal.close();
 
         MemTable recovered = new WALRecovery(tempDir).recover(new AtomicLong()).memTable();
@@ -52,7 +52,7 @@ class WALRecoveryTest {
     @Test
     void tombstonesPreservedOnRecovery() throws IOException {
         WAL wal = new WAL(tempDir, 0);
-        for (int i = 0; i < 50; i++) wal.appendPut("key-" + i, ("v-" + i).getBytes(), i);
+        for (int i = 0; i < 50; i++) wal.appendPut("key-" + i, ("v-" + i).getBytes(), i, 0);
         for (int i = 0; i < 25; i++) wal.appendDelete("key-" + i, 50 + i);
         wal.close();
 
@@ -66,7 +66,7 @@ class WALRecoveryTest {
     @Test
     void recoveryTimeFor10kEntriesUnder50ms() throws IOException {
         WAL wal = new WAL(tempDir, 0);
-        for (int i = 0; i < 10_000; i++) wal.appendPut("key-" + i, ("value-" + i).getBytes(), i);
+        for (int i = 0; i < 10_000; i++) wal.appendPut("key-" + i, ("value-" + i).getBytes(), i, 0);
         wal.close();
         long start = System.nanoTime();
         new WALRecovery(tempDir).recover(new AtomicLong());

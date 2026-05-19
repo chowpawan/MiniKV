@@ -2,15 +2,12 @@ package com.minikv.wal;
 
 import com.minikv.memtable.MemTable;
 import com.minikv.model.Entry;
-import com.minikv.model.EntryType;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.List;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class WALRecovery {
@@ -29,8 +26,9 @@ public class WALRecovery {
             ByteBuffer buf = ByteBuffer.wrap(fileBytes);
             while (buf.hasRemaining()) {
                 WALEntry walEntry = WALEntry.deserialize(buf);
-                if (walEntry == null) break; // partial write at end
-                Entry entry = new Entry(walEntry.key, walEntry.value, walEntry.seqNum, walEntry.type);
+                if (walEntry == null) break;
+                Entry entry = new Entry(walEntry.key, walEntry.value,
+                        walEntry.seqNum, walEntry.type, walEntry.expiresAt);
                 memTable.put(walEntry.key, entry);
                 maxSeq = Math.max(maxSeq, walEntry.seqNum);
                 replayedCount++;
